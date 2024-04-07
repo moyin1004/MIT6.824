@@ -45,6 +45,7 @@ func (c *Coordinator) AssignTask(tasks []Task, typ TaskType, reply *ReqestTaskRe
 		if tasks[c.pos].Status == Done {
 			continue
 		}
+		// 这里可以不判断上次被分配的时间AssignTime 未完成的可以直接再分配
 		if tasks[c.pos].Status == Init || tasks[c.pos].AssignTime+1000 <= time.Now().UnixMilli() {
 			*reply = ReqestTaskReply{
 				TaskId:  c.pos,
