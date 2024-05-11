@@ -97,12 +97,15 @@ type State struct {
 	Logs        []Log `json:"Logs"`
 }
 
-func (rf *Raft) tranFollower(term int) {
+func (rf *Raft) tranFollower(term int) bool {
 	if term > rf.state.CurrentTerm {
 		rf.state.CurrentTerm = term
 		rf.state.VotedFor = -1
 		rf.LeaderData = nil
+		DPrintf("tranFollower me:%d, resume follower", rf.me)
+		return true
 	}
+	return false
 }
 
 // return currentTerm and whether this server
@@ -220,10 +223,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	DPrintf("vote req:%v, me:%d, cur:%d", args, rf.me, rf.state.CurrentTerm)
 	rf.tranFollower(args.Term)
 	reply.CurrentTerm = rf.state.CurrentTerm
+	lastLog := &rf.state.Logs[len(rf.state.Logs)-1]
 	// 候选者日志更旧
-	if args.LastLogTerm < rf.state.Logs[len(rf.state.Logs)-1].Term {
+	if args.LastLogTerm < lastLog.Term {
 		return
-	} else if args.LastLogTerm == rf.state.Logs[len(rf.state.Logs)-1].Term && args.LastLogIndex < len(rf.state.Logs)-1 {
+	} else if args.LastLogTerm == lastLog.Term && args.LastLogIndex < lastLog.Index {
 		return
 	}
 	if rf.state.VotedFor == -1 || rf.state.VotedFor == args.CandidateId {
@@ -279,9 +283,11 @@ type AppendEntriesReply struct {
 	Term            int
 	Success         bool
 	TargetNextIndex int
+	ConflictTerm    int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	DPrintf("AppendEntries req, me:%d, req: leader:%d, term:%d, len:%d", rf.me, args.LeaderId, args.Term, len(args.Logs))
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer rf.persist()
@@ -292,30 +298,41 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.tranFollower(args.Term)
 	rf.LeaderLastActiveTime = time.Now().UnixMilli()
 	reply.Term = rf.state.CurrentTerm
-	// log
-	lastLog := rf.state.Logs[len(rf.state.Logs)-1]
-	// DPrintf("AppendEntries msg, me:%d, arg:%v, cur:%d", rf.me, args, lastLog.Index)
-	if args.PrevLogIndex > lastLog.Index {
-		reply.TargetNextIndex = lastLog.Index + 1
+	reply.ConflictTerm = -1
+	lastLog := &rf.state.Logs[len(rf.state.Logs)-1]
+	DPrintf("AppendEntries msg, me:%d, arg:%v, lastLog:%v", rf.me, args, lastLog)
+	// reply.TargetNextIndex = args.PrevLogIndex - 1
+	// 寻找任期相等的那条日志
+	find := func() int {
+		for i := len(rf.state.Logs) - 1; i >= 0; i-- {
+			if rf.state.Logs[i].Term == args.PrevLogTerm {
+				reply.TargetNextIndex = rf.state.Logs[i].Index
+				if rf.state.Logs[i].Index == args.PrevLogIndex {
+					return i
+				}
+			} else if rf.state.Logs[i].Term < args.PrevLogTerm {
+				// reply.TargetNextIndex = rf.state.Logs[i].Index
+				// 旧learder可能有很多未提交和同步的指令 index会很大 使用term查找
+				reply.ConflictTerm = rf.state.Logs[i].Term
+				break
+			}
+		}
+		return -1
+	}
+	index := find()
+	if index == -1 {
 		return
 	}
-	for i := len(rf.state.Logs) - 1; i >= 0; i-- {
-		if rf.state.Logs[i].Index == args.PrevLogIndex {
-			if rf.state.Logs[i].Term != args.PrevLogTerm {
-				reply.TargetNextIndex = args.PrevLogIndex
-				return
-			}
-			break
-		}
-	}
 	if len(args.Logs) > 0 {
-		rf.state.Logs = append(rf.state.Logs[0:args.PrevLogIndex+1], args.Logs...)
+		rf.state.Logs = append(rf.state.Logs[0:index+1], args.Logs...)
 	}
+	// rf.ServerData.CommitIndex = args.PrevLogIndex
 	reply.Success = true
 	if args.LeaderCommit > rf.ServerData.CommitIndex {
 		originCommitIndex := rf.ServerData.CommitIndex + 1
-		rf.ServerData.CommitIndex = int(math.Min(float64(args.LeaderCommit), float64(len(rf.state.Logs)-1)))
-		DPrintf("AppendEntries applymsg, me:%d, originCommitIndex:%d, cur:%d", rf.me, originCommitIndex, rf.ServerData.CommitIndex)
+		rf.ServerData.CommitIndex = int(math.Min(float64(args.LeaderCommit), float64(rf.state.Logs[len(rf.state.Logs)-1].Index)))
+		DPrintf("AppendEntries applymsg, me:%d, curindex:%d, applytoindex:%d, leadercommit:%d",
+			rf.me, originCommitIndex, rf.ServerData.CommitIndex, args.LeaderCommit)
 		rf.applymsg(originCommitIndex)
 	}
 }
@@ -358,7 +375,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 	})
 	DPrintf("Start me:%d, index:%d, term:%d, command:%v", rf.me, index, term, command)
-	go rf.recieveCommand()
+	// go rf.recieveCommand()
 
 	return index, term, isLeader
 }
@@ -390,7 +407,7 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		timeout := 300 + rf.r.Int63n(300)
+		timeout := 300 + rf.r.Int63n(200)
 		time.Sleep(time.Duration(timeout) * time.Millisecond)
 		rf.mu.Lock()
 		lastTime := rf.LeaderLastActiveTime
@@ -411,6 +428,7 @@ func (rf *Raft) ticker() {
 			LastLogIndex: rf.state.Logs[len(rf.state.Logs)-1].Index,
 			LastLogTerm:  rf.state.Logs[len(rf.state.Logs)-1].Term,
 		}
+		rf.persist()
 		rf.mu.Unlock()
 		var getTicketNum atomic.Int32
 		getTicketNum.Add(1)
@@ -437,47 +455,19 @@ func (rf *Raft) ticker() {
 						for i := range rf.LeaderData.NextIndex {
 							rf.LeaderData.NextIndex[i] = rf.state.Logs[len(rf.state.Logs)-1].Index + 1
 						}
+						// 立即广播心跳一次 等待heartBeat最长会等待150ms 可能触发不必要的选举
+						rf.broadCastAppendEntries()
 					}
 					rf.mu.Unlock()
-					// 立即广播心跳一次 等待heartBeat最长会等待150ms 可能触发不必要的选举
-					rf.broadCastAppendEntries()
 				} else if succ {
 					rf.mu.Lock()
-					rf.tranFollower(reply.CurrentTerm)
+					if rf.tranFollower(reply.CurrentTerm) {
+						rf.persist()
+					}
 					rf.mu.Unlock()
 				}
 			}(i)
 		}
-	}
-}
-
-func (rf *Raft) broadCastAppendEntries() {
-	for i := range rf.peers {
-		if i == rf.me {
-			continue
-		}
-		go func(server int) {
-			rf.callAppendEntries(server)
-		}(i)
-	}
-}
-
-func (rf *Raft) recieveCommand() {
-	for i := range rf.peers {
-		if i == rf.me {
-			continue
-		}
-		rf.mu.Lock()
-		nextIndex := rf.LeaderData.NextIndex[i]
-		if nextIndex > rf.state.Logs[len(rf.state.Logs)-1].Index {
-			rf.mu.Unlock()
-			continue
-		}
-		rf.mu.Unlock()
-		go func(server int) {
-			rf.callAppendEntries(server)
-		}(i)
-		// rf.callAppendEntries(i)
 	}
 }
 
@@ -511,27 +501,46 @@ func (rf *Raft) callAppendEntries(server int) {
 	if succ {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
-		if reply.Term > rf.state.CurrentTerm {
-			rf.tranFollower(reply.Term)
-			DPrintf("me:%d, to:%d, resume follower", rf.me, server)
-			return
-		}
 		// 可能rpc返回时 已经不是leader了 需要校验
-		if rf.LeaderData == nil {
+		if rf.tranFollower(reply.Term) || rf.LeaderData == nil {
+			rf.persist()
 			return
 		}
 		if reply.Success {
-			next := rf.LeaderData.NextIndex[server]
 			if len(req.Logs) > 0 {
-				rf.LeaderData.NextIndex[server] = next + len(req.Logs)
-				rf.LeaderData.MatchIndex[server] = req.Logs[len(req.Logs)-1].Index
+				reqIndex := req.Logs[len(req.Logs)-1].Index
+				rf.LeaderData.NextIndex[server] = int(math.Max(float64(reqIndex+1), float64(rf.LeaderData.NextIndex[server])))
+				rf.LeaderData.MatchIndex[server] = int(math.Max(float64(reqIndex), float64(rf.LeaderData.MatchIndex[server])))
 			}
-			DPrintf("broadCastAppendEntries me:%d, CommitIndex: %d, to:%d matchindex:%d", rf.me, rf.ServerData.CommitIndex, server, rf.LeaderData.MatchIndex[server])
 		} else {
-			// Todo 可以返回follower的匹配index加速处理
 			// rf.LeaderData.NextIndex[server] = int(math.Max(1.0, float64(rf.LeaderData.NextIndex[server]-1)))
-			rf.LeaderData.NextIndex[server] = int(math.Max(1.0, float64(reply.TargetNextIndex)))
+			if reply.TargetNextIndex > 0 {
+				rf.LeaderData.NextIndex[server] = int(math.Max(1.0, float64(reply.TargetNextIndex)))
+			} else if reply.ConflictTerm >= 0 {
+				for i := range rf.state.Logs {
+					if rf.state.Logs[i].Term <= reply.ConflictTerm {
+						rf.LeaderData.NextIndex[server] = rf.state.Logs[i].Index + 1
+					}
+				}
+			}
+
 		}
+		DPrintf("callAppendEntries leader:%d to:%d, lastIndex: %d, CommitIndex: %d, nextindex:%d matchindex:%d, reply:%v",
+			rf.me, server, rf.state.Logs[len(rf.state.Logs)-1].Index, rf.ServerData.CommitIndex,
+			rf.LeaderData.NextIndex[server], rf.LeaderData.MatchIndex[server], reply)
+	} else {
+		DPrintf("callAppendEntries failed leader:%d to:%d", rf.me, server)
+	}
+}
+
+func (rf *Raft) broadCastAppendEntries() {
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go func(server int) {
+			rf.callAppendEntries(server)
+		}(i)
 	}
 }
 
@@ -540,27 +549,7 @@ func (rf *Raft) leaderTicker() {
 		rf.mu.Lock()
 		isLeader := rf.LeaderData != nil
 		if isLeader {
-			originCommitIndex := rf.ServerData.CommitIndex + 1
-			for rf.ServerData.CommitIndex < rf.state.Logs[len(rf.state.Logs)-1].Index {
-				commitNum := 1
-				for i := range rf.peers {
-					if i == rf.me || rf.LeaderData.MatchIndex[i] < rf.ServerData.CommitIndex+1 {
-						continue
-					}
-					commitNum++
-					if commitNum > len(rf.peers)/2 {
-						rf.ServerData.CommitIndex++
-						break
-					}
-				}
-				if commitNum <= len(rf.peers)/2 {
-					break
-				}
-			}
-			if rf.ServerData.CommitIndex >= originCommitIndex {
-				rf.persist()
-				rf.applymsg(originCommitIndex)
-			}
+			rf.leaderCheckCommit()
 		}
 		rf.mu.Unlock()
 		if !isLeader {
@@ -572,11 +561,35 @@ func (rf *Raft) leaderTicker() {
 	}
 }
 
+func (rf *Raft) leaderCheckCommit() {
+	originCommitIndex := rf.ServerData.CommitIndex + 1
+	for rf.ServerData.CommitIndex < rf.state.Logs[len(rf.state.Logs)-1].Index {
+		commitNum := 1
+		for i := range rf.peers {
+			if i == rf.me || rf.LeaderData.MatchIndex[i] < rf.ServerData.CommitIndex+1 {
+				continue
+			}
+			commitNum++
+			if commitNum > len(rf.peers)/2 {
+				rf.ServerData.CommitIndex++
+				break
+			}
+		}
+		if commitNum <= len(rf.peers)/2 {
+
+			break
+		}
+	}
+	if rf.ServerData.CommitIndex >= originCommitIndex {
+		rf.applymsg(originCommitIndex)
+	}
+}
+
 func (rf *Raft) applymsg(originCommitIndex int) {
 	start := rf.state.Logs[0].Index
 	for ; originCommitIndex <= rf.ServerData.CommitIndex; originCommitIndex++ {
 		log := &rf.state.Logs[originCommitIndex-start]
-		DPrintf("me:%d, applymsg %d %v, CommitIndex:%d", rf.me, originCommitIndex, log, rf.ServerData.CommitIndex)
+		DPrintf("me:%d, leader:%v, applymsg %d %v, CommitIndex:%d", rf.me, rf.LeaderData != nil, originCommitIndex, log, rf.ServerData.CommitIndex)
 		rf.applyCh <- ApplyMsg{
 			CommandValid: true,
 			Command:      log.Command,
