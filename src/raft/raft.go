@@ -380,6 +380,34 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Offset            int
+	Data              []byte
+	Done              bool
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term < rf.state.CurrentTerm {
+		reply.Term = rf.state.CurrentTerm
+		return
+	}
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
 // the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
 // check whether Kill() has been called. the use of atomic avoids the
@@ -533,13 +561,29 @@ func (rf *Raft) callAppendEntries(server int) {
 	}
 }
 
+func (rf *Raft) callInstallSnapshot(server int) {
+	rf.sendAppendEntries(server, nil, nil)
+}
+
 func (rf *Raft) broadCastAppendEntries() {
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
 		go func(server int) {
-			rf.callAppendEntries(server)
+			rf.mu.Lock()
+			if rf.LeaderData == nil {
+				rf.mu.Unlock()
+				return
+			}
+			targetIndex := rf.LeaderData.NextIndex[server]
+			if targetIndex < rf.state.Logs[0].Index {
+				rf.mu.Unlock()
+				rf.callInstallSnapshot(server)
+			} else {
+				rf.mu.Unlock()
+				rf.callAppendEntries(server)
+			}
 		}(i)
 	}
 }

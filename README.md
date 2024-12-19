@@ -9,4 +9,8 @@
         - 2024.05.05  Figure 8 (unreliable)有概率失败，日志复制超过了2s 需要使用快速回退NextIndex方案
     - [ ] 2D
 - [ ] lab3 kvraft
+    - [ ] 3A
+    - [ ] 3B
 - [ ] lab4 shardkv
+    - [ ] 4A
+    - [ ] 4B
