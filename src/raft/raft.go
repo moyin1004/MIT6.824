@@ -65,19 +65,20 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 	state                State
+	Data                 []byte
 	LeaderLastActiveTime int64
 	// Leader
 	LeaderData *LeaderData `json:"LeaderData,omitempty"`
 	ServerData *ServerData
 	// other
-	r            *rand.Rand
-	applyCh      chan ApplyMsg
-	applyIndexCh chan int
+	r         *rand.Rand
+	applyCh   chan ApplyMsg
+	applyCond *sync.Cond // used to wakeup applier goroutine after committing new entries
 }
 
 type LeaderData struct {
 	NextIndex  []int `json:"NextIndex"`
-	MatchIndex []int `json:"MatchIndex"`
+	MatchIndex []int `json:"MatchIndex"` // 针对所有的服务器，内容是已知被复制到每个服务器上的最高日志条目号
 }
 
 type ServerData struct {
@@ -94,7 +95,7 @@ type Log struct {
 type State struct {
 	CurrentTerm int   `json:"CurrentTerm"`
 	VotedFor    int   `json:"VotedFor"`
-	Logs        []Log `json:"Logs"`
+	Logs        []Log `json:"Logs"` // 第一条占位 不是实际日志
 }
 
 func (rf *Raft) tranFollower(term int) bool {
@@ -143,7 +144,8 @@ func (rf *Raft) persist() {
 	}
 	// 这里直接使用json序列化state时 command反序列化时是float类型 会不匹配测试的int
 	// 使用实验提供的工具
-	rf.persister.SaveRaftState(w.Bytes())
+	// rf.persister.SaveRaftState(w.Bytes())
+	rf.persister.SaveStateAndSnapshot(w.Bytes(), rf.Data)
 }
 
 // restore previously persisted state.
@@ -177,9 +179,33 @@ func (rf *Raft) readPersist(data []byte) {
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-
 	// Your code here (2D).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if lastIncludedIndex <= rf.ServerData.CommitIndex {
+		return false
+	}
+	if lastIncludedIndex > rf.state.Logs[len(rf.state.Logs)-1].Index {
+		rf.state.Logs = []Log{{
+			Term:    lastIncludedTerm,
+			Index:   lastIncludedIndex,
+			Command: nil,
+		}}
+	} else {
+		tmp := rf.state.Logs[:]
+		rf.state.Logs = []Log{{
+			Term:    lastIncludedTerm,
+			Index:   lastIncludedIndex,
+			Command: nil,
+		}}
+		for i := lastIncludedIndex - tmp[0].Index + 1; i < len(tmp); i++ {
+			rf.state.Logs = append(rf.state.Logs, tmp[i])
+		}
+	}
+	rf.Data = snapshot
+	rf.ServerData.LastApplied, rf.ServerData.CommitIndex = lastIncludedIndex, lastIncludedIndex
+	rf.persist()
+	DPrintf("CondInstallSnapshot me:%d, state:%v, commintIndex:%d", rf.me, rf.state, rf.ServerData.CommitIndex)
 	return true
 }
 
@@ -189,7 +215,27 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	firstIndex := rf.state.Logs[0].Index
+	if index <= firstIndex {
+		DPrintf("Snapshot, cur:%d, target:%d", firstIndex, index)
+		return
+	}
+	tmp := rf.state.Logs[:]
+	// 已压缩的最后一条日志
+	rf.state.Logs = []Log{{
+		Term:    rf.state.Logs[index-firstIndex].Term,
+		Index:   index,
+		Command: nil,
+	}}
+	DPrintf("Snapshot, log num:%d", len(tmp))
+	// index+1开始
+	for i := index - firstIndex + 1; i < len(tmp); i++ {
+		rf.state.Logs = append(rf.state.Logs, tmp[i])
+	}
+	rf.Data = snapshot
+	rf.persist()
 }
 
 // example RequestVote RPC arguments structure.
@@ -333,7 +379,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.ServerData.CommitIndex = int(math.Min(float64(args.LeaderCommit), float64(rf.state.Logs[len(rf.state.Logs)-1].Index)))
 		DPrintf("AppendEntries applymsg, me:%d, curindex:%d, applytoindex:%d, leadercommit:%d",
 			rf.me, originCommitIndex, rf.ServerData.CommitIndex, args.LeaderCommit)
-		rf.applymsg(originCommitIndex)
+		// rf.applymsg()
+		rf.applyCond.Signal()
 	}
 }
 
@@ -397,10 +444,26 @@ type InstallSnapshotReply struct {
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	reply.Term = rf.state.CurrentTerm
 	if args.Term < rf.state.CurrentTerm {
-		reply.Term = rf.state.CurrentTerm
 		return
 	}
+	if rf.tranFollower(args.Term) {
+		rf.persist()
+	}
+	rf.LeaderLastActiveTime = time.Now().UnixMilli()
+	if args.LastIncludedIndex <= rf.ServerData.CommitIndex {
+		return
+	}
+
+	go func() {
+		rf.applyCh <- ApplyMsg{
+			SnapshotValid: true,
+			Snapshot:      args.Data,
+			SnapshotTerm:  args.LastIncludedTerm,
+			SnapshotIndex: args.LastIncludedIndex,
+		}
+	}()
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
@@ -562,7 +625,25 @@ func (rf *Raft) callAppendEntries(server int) {
 }
 
 func (rf *Raft) callInstallSnapshot(server int) {
-	rf.sendAppendEntries(server, nil, nil)
+	rf.mu.Lock()
+	req := InstallSnapshotArgs{
+		Term:              rf.state.CurrentTerm,
+		LeaderId:          rf.me,
+		LastIncludedIndex: rf.state.Logs[0].Index,
+		LastIncludedTerm:  rf.state.Logs[0].Term,
+		Offset:            0,
+		Data:              rf.Data,
+		Done:              true,
+	}
+	rf.mu.Unlock()
+	reply := InstallSnapshotReply{}
+	succ := rf.sendInstallSnapshot(server, &req, &reply)
+	DPrintf("callInstallSnapshot status:%v, leader:%d, to:%d", succ, rf.me, server)
+	rf.mu.Lock()
+	if rf.tranFollower(reply.Term) {
+		rf.persist()
+	}
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) broadCastAppendEntries() {
@@ -577,7 +658,8 @@ func (rf *Raft) broadCastAppendEntries() {
 				return
 			}
 			targetIndex := rf.LeaderData.NextIndex[server]
-			if targetIndex < rf.state.Logs[0].Index {
+			// Follower需要的日志已经被压缩了
+			if targetIndex <= rf.state.Logs[0].Index {
 				rf.mu.Unlock()
 				rf.callInstallSnapshot(server)
 			} else {
@@ -600,13 +682,13 @@ func (rf *Raft) leaderTicker() {
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
+		// rf.applymsg()
 		rf.broadCastAppendEntries()
 		time.Sleep(150 * time.Millisecond)
 	}
 }
 
 func (rf *Raft) leaderCheckCommit() {
-	originCommitIndex := rf.ServerData.CommitIndex + 1
 	for rf.ServerData.CommitIndex < rf.state.Logs[len(rf.state.Logs)-1].Index {
 		commitNum := 1
 		for i := range rf.peers {
@@ -620,25 +702,44 @@ func (rf *Raft) leaderCheckCommit() {
 			}
 		}
 		if commitNum <= len(rf.peers)/2 {
-
 			break
 		}
 	}
-	if rf.ServerData.CommitIndex >= originCommitIndex {
-		rf.applymsg(originCommitIndex)
-	}
+	rf.applyCond.Signal()
 }
 
-func (rf *Raft) applymsg(originCommitIndex int) {
-	start := rf.state.Logs[0].Index
-	for ; originCommitIndex <= rf.ServerData.CommitIndex; originCommitIndex++ {
-		log := &rf.state.Logs[originCommitIndex-start]
-		DPrintf("me:%d, leader:%v, applymsg %d %v, CommitIndex:%d", rf.me, rf.LeaderData != nil, originCommitIndex, log, rf.ServerData.CommitIndex)
-		rf.applyCh <- ApplyMsg{
-			CommandValid: true,
-			Command:      log.Command,
-			CommandIndex: log.Index,
+func (rf *Raft) applymsg() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		// if rf.ServerData.LastApplied >= rf.ServerData.CommitIndex {
+		// 	rf.mu.Unlock()
+		// 	time.Sleep(10 * time.Millisecond) // 睡眠时间不能过长 影响同步时间 或者改成条件变量形式
+		// 	continue
+		// }
+		for rf.ServerData.LastApplied >= rf.ServerData.CommitIndex {
+			rf.applyCond.Wait()
 		}
+		tmp := make([]Log, 0)
+		start := rf.state.Logs[0].Index
+		cur := rf.me
+		commitIndex := rf.ServerData.CommitIndex
+		originCommitIndex := rf.ServerData.LastApplied + 1
+		for ; originCommitIndex <= rf.ServerData.CommitIndex; originCommitIndex++ {
+			tmp = append(tmp, rf.state.Logs[originCommitIndex-start])
+		}
+		DPrintf("applymsg me:%d, leader:%v, LastApplied:%d, CommitIndex:%d", rf.me, rf.LeaderData != nil, rf.ServerData.LastApplied, rf.ServerData.CommitIndex)
+		rf.mu.Unlock()
+		for _, log := range tmp {
+			DPrintf("applymsg me:%d, log:%v", cur, log)
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      log.Command,
+				CommandIndex: log.Index,
+			}
+		}
+		rf.mu.Lock()
+		rf.ServerData.LastApplied = int(math.Max(float64(rf.ServerData.LastApplied), float64(commitIndex)))
+		rf.mu.Unlock()
 	}
 }
 
@@ -667,10 +768,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.applyCond = sync.NewCond(&rf.mu)
+	rf.Data = persister.ReadSnapshot()
+	rf.ServerData.LastApplied = rf.state.Logs[0].Index
 
 	// start ticker goroutine to start elections
 	go rf.ticker() // 超时选举
 	go rf.leaderTicker()
+	go rf.applymsg() // 异步 因为applyCh会阻塞造成snapshot时死锁
 
 	return rf
 }
